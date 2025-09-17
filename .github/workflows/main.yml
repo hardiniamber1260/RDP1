@@ -1,0 +1,222 @@
+name: RDP1 with Persistent Storage
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # Runs every 6 hours
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+    permissions:
+      contents: write
+
+    steps:               
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+      
+      - name: Create RDP1 User with Fixed Password
+        run: |
+          $fixedPassword = "${{ secrets.RDP1_FIXED_PASSWORD }}"
+          $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
+          $userExists = Get-LocalUser -Name "RDP1" -ErrorAction SilentlyContinue
+          if ($userExists) {
+              Set-LocalUser -Name "RDP1" -Password $securePass
+          } else {
+              New-LocalUser -Name "RDP1" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP1" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP1" -ErrorAction SilentlyContinue
+      
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: 🧹 PURGE any devices containing 'RDP1' (startup)
+        run: |
+          $hdr = @{ Authorization = "Bearer ${{ secrets.TAILSCALE_API_KEY }}" }
+          
+          Write-Host "Searching for RDP1 devices to purge..."
+          
+          try {
+            # Use the correct API endpoint for listing devices
+            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/${{ secrets.TAILSCALE_TAILNET }}/devices" -ErrorAction Stop
+            
+            $RDP1Devices = $resp.devices | Where-Object { 
+              $_.name -match '(?i)RDP1' -or 
+              $_.hostname -match '(?i)RDP1' -or 
+              $_.dnsname -match '(?i)RDP1'
+            }
+            
+            Write-Host "Found $($RDP1Devices.Count) RDP1 devices to purge"
+            
+            foreach ($device in $RDP1Devices) {
+              try {
+                Write-Host "Deleting: $($device.name) (ID: $($device.id))"
+                Invoke-RestMethod -Method DELETE -Headers $hdr -Uri "https://api.tailscale.com/api/v2/device/$($device.id)" -ErrorAction Stop
+                Write-Host "✓ Successfully deleted: $($device.name)"
+              } catch {
+                Write-Warning "Failed to delete $($device.name): $($_.Exception.Message)"
+              }
+            }
+            
+          } catch {
+            Write-Warning "Device purge failed: $($_.Exception.Message)"
+            Write-Warning "Response: $($_.Exception.Response.StatusCode)"
+            Write-Warning "Make sure TAILSCALE_TAILNET is set to: hardiniamber1260.github.beta.tailscale.net"
+          }
+      
+      - name: Establish Tailscale Connection with RDP1 hostname
+        run: |
+          $desiredHostname = "RDP1"
+          Write-Host "Forcing hostname: $desiredHostname"
+          
+          # Clean any existing local state
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" down
+          Start-Sleep -Seconds 2
+          
+          # Force the desired hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$desiredHostname --accept-routes=true --accept-dns=true --reset
+          
+          $tsIP = $null
+          $tsHostname = $null
+          $retries = 0
+          $maxRetries = 25
+          
+          while ($retries -lt $maxRetries) {
+              $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+              if ($status -and $status.BackendState -eq "Running") {
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+                  $tsHostname = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json | Select-Object -ExpandProperty Self | Select-Object -ExpandProperty DNSName -ErrorAction SilentlyContinue
+                  if ($tsIP -and $tsHostname) { 
+                      Write-Host "Successfully connected to Tailscale!"
+                      
+                      # Verify hostname is correct
+                      if ($tsHostname -like "*RDP1*") {
+                          Write-Host "✓ Hostname verified: $tsHostname"
+                          break
+                      } else {
+                          Write-Host "Hostname mismatch. Got: $tsHostname, Expected: RDP1"
+                          $tsIP = $null
+                      }
+                  }
+              }
+              Write-Host "Waiting for Tailscale connection... (Attempt $($retries + 1)/$maxRetries)"
+              Start-Sleep -Seconds 3
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale failed to connect with hostname RDP1 after $maxRetries attempts"
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          echo "TAILSCALE_HOSTNAME=$tsHostname" >> $env:GITHUB_ENV
+          echo "RDP_CONNECTION_STRING=$desiredHostname" >> $env:GITHUB_ENV
+          Write-Host "Tailscale connected successfully!"
+          Write-Host "IP: $tsIP"
+          Write-Host "Hostname: $tsHostname"
+          Write-Host "Connection Name: $desiredHostname"
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Testing RDP connection to: $env:TAILSCALE_IP"
+          
+          $maxRetries = 15
+          $retryCount = 0
+          $connected = $false
+          
+          while ($retryCount -lt $maxRetries -and -not $connected) {
+              try {
+                  $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet -ErrorAction Stop
+                  if ($testResult) {
+                      $connected = $true
+                      Write-Host "RDP connection successful!"
+                      break
+                  }
+              } catch {
+                  Write-Host "RDP test attempt $($retryCount + 1)/$maxRetries failed, retrying..."
+              }
+              $retryCount++
+              Start-Sleep -Seconds 2
+          }
+          
+          if (-not $connected) {
+              Write-Error "RDP connection failed after $maxRetries attempts"
+              exit 1
+          }
+      
+      - name: Display Connection Information
+        run: |
+          Write-Host "`n=== RDP ACCESS INFORMATION ==="
+          Write-Host "Connection Address: $env:RDP_CONNECTION_STRING"
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP1"
+          Write-Host "=================================`n"
+          
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## RDP Connection Details"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Address:** $env:RDP_CONNECTION_STRING"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**IP Address:** $env:TAILSCALE_IP"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Username:** RDP1"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Password:** `${{ secrets.RDP1_FIXED_PASSWORD }}"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Session Started:** $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            
+      - name: Keep RDP session active
+        run: |
+          $endTime = (Get-Date).AddMinutes(355)
+          
+          while ((Get-Date) -lt $endTime) {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Active"
+              Start-Sleep -Seconds 30
+          }
+          
+          Write-Host "RDP session completed successfully!"
+      - name: 🧹 PURGE any devices containing 'RDP1' (shutdown)
+        if: always()
+        run: |
+          $hdr = @{ Authorization = "Bearer ${{ secrets.TAILSCALE_API_KEY }}" }
+          
+          Write-Host "Searching for RDP1 devices to purge..."
+          
+          try {
+            # Use the correct API endpoint for listing devices
+            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/${{ secrets.TAILSCALE_TAILNET }}/devices" -ErrorAction Stop
+            
+            $RDP1Devices = $resp.devices | Where-Object { 
+              $_.name -match '(?i)RDP1' -or 
+              $_.hostname -match '(?i)RDP1' -or 
+              $_.dnsname -match '(?i)RDP1'
+            }
+            
+            Write-Host "Found $($RDP1Devices.Count) RDP1 devices to purge"
+            
+            foreach ($device in $RDP1Devices) {
+              try {
+                Write-Host "Deleting: $($device.name) (ID: $($device.id))"
+                Invoke-RestMethod -Method DELETE -Headers $hdr -Uri "https://api.tailscale.com/api/v2/device/$($device.id)" -ErrorAction Stop
+                Write-Host "✓ Successfully deleted: $($device.name)"
+              } catch {
+                Write-Warning "Failed to delete $($device.name): $($_.Exception.Message)"
+              }
+            }
+            
+          } catch {
+            Write-Warning "Device purge failed: $($_.Exception.Message)"
+            Write-Warning "Response: $($_.Exception.Response.StatusCode)"
+            Write-Warning "Make sure TAILSCALE_TAILNET is set to: hardiniamber1260.github.beta.tailscale.net"
+          }
